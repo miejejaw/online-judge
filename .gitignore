@@ -1,0 +1,41 @@
+# Binaries for programs and plugins
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+main
+
+# Ignore .env file
+.env
+
+# Do not ignore sample.env
+!sample.env
+
+# Output files
+/app/main
+
+# Ignore the vendor directory
+/vendor/
+
+# Ignore Go dependency files
+go.sum
+go.mod
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Editor directories and files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Ignore log files and temporary files
+*.log
+*.tmp
+*.out
+
+# Ignore Docker-related files
+docker-compose.override.yml

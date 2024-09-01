@@ -1,0 +1,30 @@
+# Ignore the git repository folder
+.git
+.gitignore
+
+# Ignore local Go binaries
+/app/main
+
+# Ignore Docker-related files
+docker-compose.yml
+docker-compose.override.yml
+Dockerfile*
+
+# Ignore editor directories and files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Ignore OS-specific files
+.DS_Store
+Thumbs.db
+
+# Ignore test and log files
+*.log
+*.tmp
+*.out
+*.test
+
+# Ignore vendor directory (if you're using Go modules)
+vendor/
