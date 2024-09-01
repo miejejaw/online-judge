@@ -1,6 +1,9 @@
 # Use the official Golang image as the base image
 FROM golang:1.21-alpine
 
+# Install Python
+RUN apk add --no-cache python3 py3-pip
+
 # Set the Current Working Directory inside the container
 WORKDIR /app
 
@@ -12,6 +15,9 @@ RUN go mod download
 
 # Copy the source from the current directory to the Working Directory inside the container
 COPY . .
+
+# Copy the .env file to the working directory
+COPY .env ./
 
 # Set the working directory to the path where the main.go is located
 WORKDIR /app/cmd/app
