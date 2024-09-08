@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"strings"
@@ -77,8 +78,9 @@ func executeWithDocker(submission Submission) (string, time.Duration, string) {
 
 	// Create the container
 	resp, err := cli.ContainerCreate(context.Background(), &container.Config{
-		Image: image,
-		Cmd:   cmd,
+		Image:     image,
+		Cmd:       cmd,
+		OpenStdin: true,
 	}, &container.HostConfig{
 		AutoRemove: true, // Automatically remove the container after execution
 	}, nil, nil, "")
@@ -90,6 +92,19 @@ func executeWithDocker(submission Submission) (string, time.Duration, string) {
 	if err := cli.ContainerStart(context.Background(), resp.ID, container.StartOptions{}); err != nil {
 		return fmt.Sprintf("Error starting Docker container: %v", err), 0, ""
 	}
+
+	// attach the container to stdin
+	hijackedResp, err := cli.ContainerAttach(context.Background(), resp.ID, container.AttachOptions{Stream: true, Stdin: true})
+	if err != nil {
+		return fmt.Sprintf("Error attaching to Docker container: %v", err), 0, ""
+	}
+
+	// Send input to the container via stdin
+	_, err = io.Copy(hijackedResp.Conn, strings.NewReader(submission.Input))
+	if err != nil {
+		return fmt.Sprintf("Error sending input to container: %v", err), 0, ""
+	}
+	hijackedResp.Close()
 
 	// Set the timeout for execution
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(submission.TimeLimit)*time.Second)
