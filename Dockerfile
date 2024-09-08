@@ -1,9 +1,6 @@
 # Use the official Golang image as the base image
 FROM golang:1.21-alpine
 
-# Install Python
-RUN apk add --no-cache python3 py3-pip
-
 # Set the Current Working Directory inside the container
 WORKDIR /app
 
@@ -17,16 +14,19 @@ RUN go mod download
 COPY . .
 
 # Copy the .env file to the working directory
-COPY .env ./
+#COPY .env ./
 
 # Set the working directory to the path where the main.go is located
-WORKDIR /app/cmd/app
+WORKDIR /app/cmd/judge
 
-# Build the Go app
-RUN go build -o /cmd/app/main .
+# Build the Go judge
+RUN go build -o /cmd/judge/main .
+
+# Step 6: Use a lightweight image for running the app
+#FROM alpine:latest
 
 # Expose port 8080 to the outside world
 EXPOSE 8080
 
 # Command to run the executable
-CMD ["/cmd/app/main"]
+CMD ["/cmd/judge/main"]

@@ -16,7 +16,7 @@ func NewRunController() *RunController {
 func (ctrl *RunController) RunCode(c *gin.Context) {
 
 	// Execute the Python script
-	cmd := exec.Command("python3", "a.py")
+	cmd := exec.Command("python3", "main.py")
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
