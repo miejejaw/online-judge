@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"net/http"
 	"strings"
@@ -68,7 +67,7 @@ func executeWithDocker(submission Submission) (string, time.Duration, string) {
 	switch submission.Language {
 	case "python":
 		image = "python-exec"
-		cmd = []string{"python", "-c", submission.Code} // Execute Python code
+		cmd = []string{"python3", "-c", submission.Code} // Execute Python code
 	case "cpp":
 		image = "gcc:latest"
 		cmd = []string{"bash", "-c", fmt.Sprintf(`echo "%s" > /tmp/code.cpp && g++ /tmp/code.cpp -o /tmp/a.out && /tmp/a.out`, submission.Code)} // Compile and run C++ code
@@ -76,12 +75,10 @@ func executeWithDocker(submission Submission) (string, time.Duration, string) {
 		return "Unsupported language", 0, ""
 	}
 
-	// Create the container (no timeout here since we want to control when the execution starts)
+	// Create the container
 	resp, err := cli.ContainerCreate(context.Background(), &container.Config{
-		Image:     image,
-		Cmd:       cmd,
-		OpenStdin: true,  // Enable stdin to pass the input
-		Tty:       false, // Disable tty for proper input handling
+		Image: image,
+		Cmd:   cmd,
 	}, &container.HostConfig{
 		AutoRemove: true, // Automatically remove the container after execution
 	}, nil, nil, "")
@@ -89,42 +86,28 @@ func executeWithDocker(submission Submission) (string, time.Duration, string) {
 		return fmt.Sprintf("Error creating Docker container: %v", err), 0, ""
 	}
 
-	// Start the container (without starting the timer yet)
+	// Start the container
 	if err := cli.ContainerStart(context.Background(), resp.ID, container.StartOptions{}); err != nil {
 		return fmt.Sprintf("Error starting Docker container: %v", err), 0, ""
 	}
 
-	// Attach to the container to send input
-	hijackedResp, err := cli.ContainerAttach(context.Background(), resp.ID, container.AttachOptions{
-		Stdin:  true,
-		Stream: true,
-	})
-	if err != nil {
-		return fmt.Sprintf("Error attaching to Docker container: %v", err), 0, ""
-	}
-
-	// Send input to the container
-	io.Copy(hijackedResp.Conn, io.NopCloser(strings.NewReader(submission.Input)))
-	hijackedResp.Close()
-
-	// Now set the timeout only for the execution phase
+	// Set the timeout for execution
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(submission.TimeLimit)*time.Second)
 	defer cancel()
 
-	start := time.Now() // Start the timer now, right before waiting for execution
+	start := time.Now() // Start the timer
 
-	// Wait for the container to finish execution (with timeout for execution)
+	// Wait for the container to finish execution
 	statusCh, errCh := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
 	select {
 	case err := <-errCh:
 		if err != nil {
-			cli.ContainerRemove(context.Background(), resp.ID, container.RemoveOptions{Force: true})
 			return fmt.Sprintf("Error waiting for Docker container: %v", err), 0, ""
 		}
 	case <-statusCh:
 	}
 
-	// Measure execution time (from start of code execution to finish)
+	// Measure execution time
 	execTime := time.Since(start)
 
 	// Fetch the container logs (output)
@@ -139,14 +122,8 @@ func executeWithDocker(submission Submission) (string, time.Duration, string) {
 		return fmt.Sprintf("Error reading container logs: %v", err), 0, ""
 	}
 
-	// Clean up the output: remove any non-ASCII characters, control characters, and unnecessary whitespace
+	// Clean up the output by trimming excess whitespace
 	cleanOutput := sanitizeOutput(string(output))
-
-	// Ensure the container is removed after execution
-	err = cli.ContainerRemove(context.Background(), resp.ID, container.RemoveOptions{Force: true})
-	if err != nil {
-		return "", 0, ""
-	}
 
 	// Compare the output with the expected output
 	if cleanOutput == submission.Output {
