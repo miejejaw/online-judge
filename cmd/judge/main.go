@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -209,7 +211,7 @@ func runCodeInIsolate(language, filename, input string, cpuTimeLimit, wallTimeLi
 	// Parse the metadata file
 	var maxMemory int
 	var maxTime string
-	var status string
+	//var status string
 	lines := bytes.Split(metaData, []byte("\n"))
 	for _, line := range lines {
 		parts := bytes.SplitN(line, []byte(":"), 2)
@@ -224,8 +226,8 @@ func runCodeInIsolate(language, filename, input string, cpuTimeLimit, wallTimeLi
 			maxMemory, _ = strconv.Atoi(value) // Maximum memory usage in KB
 		case "time":
 			maxTime = value // Execution time (in seconds)
-		case "status":
-			status = value // Status of execution
+			//case "status":
+			//	status = value // Status of execution
 		}
 	}
 
@@ -236,11 +238,39 @@ func runCodeInIsolate(language, filename, input string, cpuTimeLimit, wallTimeLi
 	result.Memory = maxMemory // Use real memory usage from the metadata
 
 	// Set the status based on metadata
-	if status == "" {
-		result.Message = "Unknown status"
-	} else {
-		result.Message = status
+	meta, err := getMetadata(metaFilePath)
+	if err != nil {
+		return result, nil
 	}
+	result.Status = meta["status"]
+	result.Message = meta["message"]
 
 	return result, nil
+}
+
+func getMetadata(metadataFilePath string) (map[string]string, error) {
+	metadata := make(map[string]string)
+
+	file, err := os.Open(metadataFilePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open metadata file: %v", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+			metadata[key] = value
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading metadata file: %v", err)
+	}
+
+	return metadata, nil
 }
