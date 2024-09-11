@@ -1,163 +1,167 @@
 package main
 
 import (
-	"context"
+	"bytes"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"net/http"
-	"strings"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
 	"github.com/gin-gonic/gin"
 )
 
-// Submission represents the structure of a code submission
 type Submission struct {
-	Code        string `json:"code" binding:"required"`
-	Language    string `json:"language" binding:"required"`
-	Input       string `json:"input" binding:"required"`
-	Output      string `json:"output" binding:"required"`
-	TimeLimit   int    `json:"time_limit" binding:"required"`   // in seconds
-	MemoryLimit int    `json:"memory_limit" binding:"required"` // in MB (currently not enforced)
+	Language      string `json:"language"`
+	Code          string `json:"code"`
+	Input         string `json:"input"`
+	CPUTimeLimit  int    `json:"cpuTimeLimit"`  // CPU time limit in seconds
+	WallTimeLimit int    `json:"wallTimeLimit"` // Wall clock time limit in seconds
+	MemoryLimit   int    `json:"memoryLimit"`   // Memory limit in KB
 }
 
 func main() {
 	r := gin.Default()
 
-	// Route to handle code submissions
-	r.POST("/submit", handleSubmission)
+	// API route for code submission
+	r.POST("/submit", func(c *gin.Context) {
+		var submission Submission
+		if err := c.ShouldBindJSON(&submission); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+			return
+		}
 
-	// Start the server
-	r.Run(":8080") // Server runs on port 8080
-}
-
-// handleSubmission handles the incoming code submissions
-func handleSubmission(c *gin.Context) {
-	var submission Submission
-
-	// Parse JSON input
-	if err := c.ShouldBindJSON(&submission); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Execute the submitted code using Docker SDK
-	result, execTime, output := executeWithDocker(submission)
-
-	// Return the result as JSON
-	c.JSON(http.StatusOK, gin.H{
-		"result":         result,
-		"execution_time": fmt.Sprintf("%v ms", execTime.Milliseconds()),
-		"output":         output,
-	})
-}
-
-func executeWithDocker(submission Submission) (string, time.Duration, string) {
-	// Initialize Docker client
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		return fmt.Sprintf("Error initializing Docker client: %v", err), 0, ""
-	}
-
-	// Choose the container image based on the programming language
-	var image string
-	var cmd []string
-	switch submission.Language {
-	case "python":
-		image = "python-exec"
-		cmd = []string{"python3", "-c", submission.Code} // Execute Python code
-	case "cpp":
-		image = "gcc:latest"
-		cmd = []string{"bash", "-c", fmt.Sprintf(`echo "%s" > /tmp/code.cpp && g++ /tmp/code.cpp -o /tmp/a.out && /tmp/a.out`, submission.Code)} // Compile and run C++ code
-	default:
-		return "Unsupported language", 0, ""
-	}
-
-	// Create the container
-	resp, err := cli.ContainerCreate(context.Background(), &container.Config{
-		Image:     image,
-		Cmd:       cmd,
-		OpenStdin: true,
-	}, &container.HostConfig{
-		AutoRemove: true, // Automatically remove the container after execution
-	}, nil, nil, "")
-	if err != nil {
-		return fmt.Sprintf("Error creating Docker container: %v", err), 0, ""
-	}
-
-	// Start the container
-	if err := cli.ContainerStart(context.Background(), resp.ID, container.StartOptions{}); err != nil {
-		return fmt.Sprintf("Error starting Docker container: %v", err), 0, ""
-	}
-
-	// attach the container to stdin
-	hijackedResp, err := cli.ContainerAttach(context.Background(), resp.ID, container.AttachOptions{Stream: true, Stdin: true})
-	if err != nil {
-		return fmt.Sprintf("Error attaching to Docker container: %v", err), 0, ""
-	}
-
-	// Send input to the container via stdin
-	_, err = io.Copy(hijackedResp.Conn, strings.NewReader(submission.Input))
-	if err != nil {
-		return fmt.Sprintf("Error sending input to container: %v", err), 0, ""
-	}
-	hijackedResp.Close()
-
-	// Set the timeout for execution
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(submission.TimeLimit)*time.Second)
-	defer cancel()
-
-	start := time.Now() // Start the timer
-
-	// Wait for the container to finish execution
-	statusCh, errCh := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
-	select {
-	case err := <-errCh:
+		// Create unique file for the submitted code
+		filename, err := saveCode(submission.Language, submission.Code)
 		if err != nil {
-			return fmt.Sprintf("Error waiting for Docker container: %v", err), 0, ""
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save code"})
+			return
 		}
-	case <-statusCh:
-	}
 
-	// Measure execution time
-	execTime := time.Since(start)
+		// Run the code inside the Isolate sandbox with input and resource limits
+		result, err := runCodeInIsolate(
+			submission.Language, filename, submission.Input,
+			submission.CPUTimeLimit, submission.WallTimeLimit, submission.MemoryLimit)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
 
-	// Fetch the container logs (output)
-	out, err := cli.ContainerLogs(context.Background(), resp.ID, container.LogsOptions{ShowStdout: true, ShowStderr: true})
+		// Return the result of the execution
+		c.JSON(http.StatusOK, gin.H{"result": result})
+	})
+
+	err := r.Run()
 	if err != nil {
-		return fmt.Sprintf("Error fetching container logs: %v", err), 0, ""
-	}
+		return
+	} // Default to :8080
+}
 
-	// Read the logs (container output)
-	output, err := ioutil.ReadAll(out)
+// saveCode saves the submitted code to a file
+func saveCode(language, code string) (string, error) {
+	timestamp := time.Now().Unix()
+	filename := fmt.Sprintf("internal/submissions/code_%d.%s", timestamp, getExtension(language))
+	err := os.WriteFile(filename, []byte(code), 0644)
 	if err != nil {
-		return fmt.Sprintf("Error reading container logs: %v", err), 0, ""
+		return "", err
 	}
+	return filename, nil
+}
 
-	// Clean up the output by trimming excess whitespace
-	cleanOutput := sanitizeOutput(string(output))
-
-	// Compare the output with the expected output
-	if cleanOutput == submission.Output {
-		return "Accepted", execTime, cleanOutput
-	} else {
-		return "Wrong Answer", execTime, cleanOutput
+// getExtension returns file extension based on language
+func getExtension(language string) string {
+	switch language {
+	case "c":
+		return "c"
+	case "cpp":
+		return "cpp"
+	case "python":
+		return "py"
+	case "java":
+		return "java"
+	default:
+		return "txt"
 	}
 }
 
-// sanitizeOutput removes unwanted characters from the container output
-func sanitizeOutput(output string) string {
-	// Remove any non-printable characters (like control characters)
-	cleanOutput := strings.Map(func(r rune) rune {
-		if r >= 32 && r <= 126 || r == '\n' || r == '\r' {
-			return r
-		}
-		return -1
-	}, output)
+func runCodeInIsolate(language, filename, input string, cpuTimeLimit, wallTimeLimit, memoryLimit int) (string, error) {
+	// Isolate boxId (you can manage different boxes for users if needed)
+	boxId := "0"
 
-	// Trim leading/trailing spaces and newlines
-	return strings.TrimSpace(cleanOutput)
+	// Initialize the isolate box
+	initCmd := exec.Command("isolate", "--init", "--box-id", boxId)
+	if err := initCmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to initialize sandbox: %v", err)
+	}
+
+	// Defer cleanup to remove the box after execution
+	defer func() {
+		cleanupCmd := exec.Command("isolate", "--cleanup", "--box-id", boxId)
+		_ = cleanupCmd.Run() // Cleanup errors can be ignored
+	}()
+
+	// Path to the sandbox
+	boxPath := fmt.Sprintf("/var/local/lib/isolate/%s/box", boxId)
+
+	// Move the code file to the box
+	codeFilePath := fmt.Sprintf("%s/%s", boxPath, filepath.Base(filename))
+	if err := exec.Command("cp", filename, codeFilePath).Run(); err != nil {
+		return "", fmt.Errorf("failed to copy code to sandbox: %v", err)
+	}
+
+	// Base isolate command with time and memory limits
+	command := []string{
+		"isolate",
+		"--run",
+		"--box-id", boxId,
+		"--time", fmt.Sprintf("%d", cpuTimeLimit), // CPU time limit
+		"--wall-time", fmt.Sprintf("%d", wallTimeLimit), // Real-time limit
+		"--mem", fmt.Sprintf("%d", memoryLimit), // Memory limit in KB
+		"--"}
+
+	// Add language-specific commands
+	switch language {
+	case "c":
+		// Compile C program
+		cmd := exec.Command("gcc", codeFilePath, "-o", filepath.Join(boxPath, "a.out"))
+		if err := cmd.Run(); err != nil {
+			return "", fmt.Errorf("compilation failed")
+		}
+		command = append(command, "./a.out")
+	case "cpp":
+		// Compile C++ program
+		cmd := exec.Command("g++", codeFilePath, "-o", filepath.Join(boxPath, "a.out"))
+		if err := cmd.Run(); err != nil {
+			return "", fmt.Errorf("compilation failed")
+		}
+		command = append(command, "./a.out")
+	case "python":
+		// Run Python script directly
+		command = append(command, "/usr/bin/python3", filepath.Base(codeFilePath))
+	case "java":
+		// Compile and run Java program
+		cmd := exec.Command("javac", codeFilePath)
+		if err := cmd.Run(); err != nil {
+			return "", fmt.Errorf("compilation failed")
+		}
+		command = append(command, "/usr/bin/java", "Main") // Assuming the main class is "Main"
+	default:
+		return "", fmt.Errorf("unsupported language")
+	}
+
+	// Prepare to execute the code with input and limits
+	cmd := exec.Command(command[0], command[1:]...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	cmd.Stdin = bytes.NewBufferString(input) // Pass input to the program's stdin
+
+	// Run the program inside Isolate
+	if err := cmd.Run(); err != nil {
+		// Return detailed error with stderr
+		return "", fmt.Errorf("execution failed: %v", stderr.String())
+	}
+
+	return stdout.String(), nil
 }

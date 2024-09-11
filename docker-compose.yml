@@ -1,32 +1,26 @@
-
 services:
-  api:
+  judge:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: go-judge
     ports:
       - "8080:8080"
+    environment:
+      - GO_ENV=development
+      - PORT=8080
     volumes:
-      - "/var/run/docker.sock:/var/run/docker.sock" # Mount Docker socket
-    networks:
-      - judge-net
+      - .:/app  # Mount local code to the container for development
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw # Mount system cgroups to support Isolate
+      - ./internal/submissions:/internal/submissions
+    cap_add:
+      - SYS_PTRACE  # Add capabilities required by Isolate for process tracing
+      - SYS_ADMIN   # Add this to allow Isolate to clone processes and other admin tasks
+      - NET_ADMIN   # Add this to manage network interfaces
+    security_opt:
+      - seccomp:unconfined # Disable seccomp for Isolate (it uses advanced kernel features)
+    privileged: true  # Run the container in privileged mode to enable all capabilities
 
-  python-exec:
-    build:
-      context: docker/python
-    image: python-exec
-    networks:
-      - judge-net
-    command: tail -f /dev/null 
-
-  cpp-exec:
-    build:
-      context: docker/cpp
-    image: cpp-exec
-    networks:
-      - judge-net
-    command: tail -f /dev/null 
-
-networks:
-  judge-net:
-    driver: bridge
+volumes:
+  isolate-data:
+    driver: local
