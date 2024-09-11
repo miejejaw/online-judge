@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,6 +22,16 @@ type Submission struct {
 	MemoryLimit   int    `json:"memoryLimit"`   // Memory limit in KB
 }
 
+type ExecutionResult struct {
+	Message       string `json:"message"`
+	Status        string `json:"status"` // Exit code of the program
+	Stdout        string `json:"stdout"`
+	Stderr        string `json:"stderr"`
+	CompileOutput string `json:"compile_output"`
+	Time          string `json:"time"`
+	Memory        int    `json:"memory"`
+}
+
 func main() {
 	r := gin.Default()
 
@@ -28,14 +39,14 @@ func main() {
 	r.POST("/submit", func(c *gin.Context) {
 		var submission Submission
 		if err := c.ShouldBindJSON(&submission); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+			c.JSON(http.StatusBadRequest, gin.H{"message": "Invalid request body", "status": "error"})
 			return
 		}
 
 		// Create unique file for the submitted code
 		filename, err := saveCode(submission.Language, submission.Code)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save code"})
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to save code", "status": "error"})
 			return
 		}
 
@@ -44,12 +55,12 @@ func main() {
 			submission.Language, filename, submission.Input,
 			submission.CPUTimeLimit, submission.WallTimeLimit, submission.MemoryLimit)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error(), "status": "error"})
 			return
 		}
 
 		// Return the result of the execution
-		c.JSON(http.StatusOK, gin.H{"result": result})
+		c.JSON(http.StatusOK, result)
 	})
 
 	err := r.Run()
@@ -85,14 +96,24 @@ func getExtension(language string) string {
 	}
 }
 
-func runCodeInIsolate(language, filename, input string, cpuTimeLimit, wallTimeLimit, memoryLimit int) (string, error) {
+func runCodeInIsolate(language, filename, input string, cpuTimeLimit, wallTimeLimit, memoryLimit int) (ExecutionResult, error) {
+	// Initialize the result struct
+	result := ExecutionResult{
+		Message:       "",
+		Stdout:        "",
+		Stderr:        "",
+		CompileOutput: "",
+		Time:          "",
+		Memory:        0,
+	}
+
 	// Isolate boxId (you can manage different boxes for users if needed)
 	boxId := "0"
 
 	// Initialize the isolate box
 	initCmd := exec.Command("isolate", "--init", "--box-id", boxId)
 	if err := initCmd.Run(); err != nil {
-		return "", fmt.Errorf("failed to initialize sandbox: %v", err)
+		return ExecutionResult{}, fmt.Errorf("failed to initialize sandbox: %v", err)
 	}
 
 	// Defer cleanup to remove the box after execution
@@ -107,8 +128,11 @@ func runCodeInIsolate(language, filename, input string, cpuTimeLimit, wallTimeLi
 	// Move the code file to the box
 	codeFilePath := fmt.Sprintf("%s/%s", boxPath, filepath.Base(filename))
 	if err := exec.Command("cp", filename, codeFilePath).Run(); err != nil {
-		return "", fmt.Errorf("failed to copy code to sandbox: %v", err)
+		return ExecutionResult{}, fmt.Errorf("failed to copy code to sandbox: %v", err)
 	}
+
+	// Create a path for the metadata file to capture execution statistics
+	metaFilePath := fmt.Sprintf("/var/local/lib/isolate/%s/meta", boxId)
 
 	// Base isolate command with time and memory limits
 	command := []string{
@@ -118,22 +142,31 @@ func runCodeInIsolate(language, filename, input string, cpuTimeLimit, wallTimeLi
 		"--time", fmt.Sprintf("%d", cpuTimeLimit), // CPU time limit
 		"--wall-time", fmt.Sprintf("%d", wallTimeLimit), // Real-time limit
 		"--mem", fmt.Sprintf("%d", memoryLimit), // Memory limit in KB
+		"--meta", metaFilePath, // Metadata file for stats
 		"--"}
+
+	var compileOutput bytes.Buffer
 
 	// Add language-specific commands
 	switch language {
 	case "c":
 		// Compile C program
 		cmd := exec.Command("gcc", codeFilePath, "-o", filepath.Join(boxPath, "a.out"))
+		cmd.Stderr = &compileOutput
 		if err := cmd.Run(); err != nil {
-			return "", fmt.Errorf("compilation failed")
+			result.Status = "compilation_error"
+			result.CompileOutput = compileOutput.String()
+			return result, nil
 		}
 		command = append(command, "./a.out")
 	case "cpp":
 		// Compile C++ program
 		cmd := exec.Command("g++", codeFilePath, "-o", filepath.Join(boxPath, "a.out"))
+		cmd.Stderr = &compileOutput
 		if err := cmd.Run(); err != nil {
-			return "", fmt.Errorf("compilation failed")
+			result.Status = "compilation_error"
+			result.CompileOutput = compileOutput.String()
+			return result, nil
 		}
 		command = append(command, "./a.out")
 	case "python":
@@ -142,12 +175,15 @@ func runCodeInIsolate(language, filename, input string, cpuTimeLimit, wallTimeLi
 	case "java":
 		// Compile and run Java program
 		cmd := exec.Command("javac", codeFilePath)
+		cmd.Stderr = &compileOutput
 		if err := cmd.Run(); err != nil {
-			return "", fmt.Errorf("compilation failed")
+			result.Status = "compilation_error"
+			result.CompileOutput = compileOutput.String()
+			return result, nil
 		}
 		command = append(command, "/usr/bin/java", "Main") // Assuming the main class is "Main"
 	default:
-		return "", fmt.Errorf("unsupported language")
+		return ExecutionResult{}, fmt.Errorf("unsupported language")
 	}
 
 	// Prepare to execute the code with input and limits
@@ -160,8 +196,51 @@ func runCodeInIsolate(language, filename, input string, cpuTimeLimit, wallTimeLi
 	// Run the program inside Isolate
 	if err := cmd.Run(); err != nil {
 		// Return detailed error with stderr
-		return "", fmt.Errorf("execution failed: %v", stderr.String())
+		result.Stderr = stderr.String()
+		return result, nil
 	}
 
-	return stdout.String(), nil
+	// Read the Isolate metadata file to get memory and time usage
+	metaData, err := os.ReadFile(metaFilePath)
+	if err != nil {
+		return ExecutionResult{}, fmt.Errorf("failed to read metadata file: %v", err)
+	}
+
+	// Parse the metadata file
+	var maxMemory int
+	var maxTime string
+	var status string
+	lines := bytes.Split(metaData, []byte("\n"))
+	for _, line := range lines {
+		parts := bytes.SplitN(line, []byte(":"), 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		key := string(parts[0])
+		value := string(parts[1])
+		switch key {
+		case "max-rss":
+			maxMemory, _ = strconv.Atoi(value) // Maximum memory usage in KB
+		case "time":
+			maxTime = value // Execution time (in seconds)
+		case "status":
+			status = value // Status of execution
+		}
+	}
+
+	// Fill result fields
+	result.Stdout = stdout.String()
+	result.Stderr = stderr.String()
+	result.Time = maxTime
+	result.Memory = maxMemory // Use real memory usage from the metadata
+
+	// Set the status based on metadata
+	if status == "" {
+		result.Message = "Unknown status"
+	} else {
+		result.Message = status
+	}
+
+	return result, nil
 }
